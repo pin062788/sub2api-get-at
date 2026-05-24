@@ -818,6 +818,20 @@ def account_email(account: dict[str, Any]) -> str:
     return str(credentials.get("email") or account.get("email") or account.get("name") or "").strip().lower()
 
 
+def normalize_status_value(value: Any) -> str:
+    if isinstance(value, (dict, list)):
+        return normalize_text(json.dumps(value, ensure_ascii=False))
+    return normalize_text(value)
+
+
+def field_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
+
+
+def is_active_status(account: dict[str, Any]) -> bool:
+    return normalize_status_value(account.get("status")) in {"active", "ok", "enabled", "normal"}
+
+
 def is_401_account(account: dict[str, Any]) -> bool:
     values = [
         account.get("status"),
@@ -826,20 +840,33 @@ def is_401_account(account: dict[str, Any]) -> bool:
         account.get("session_window_status"),
         account.get("credentials_status"),
     ]
-    text = " ".join(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "") for value in values)
-    return "401" in text or "unauthorized" in text.lower()
+    text = " ".join(field_text(value) for value in values).lower()
+    return "401" in text or "unauthorized" in text
 
 
 def is_403_account(account: dict[str, Any]) -> bool:
-    values = [
-        account.get("status"),
-        account.get("error_message"),
-        account.get("temp_unschedulable_reason"),
-        account.get("session_window_status"),
-        account.get("credentials_status"),
+    if is_active_status(account):
+        return False
+
+    status_values = [
+        normalize_status_value(account.get("status")),
+        normalize_status_value(account.get("session_window_status")),
+        normalize_status_value(account.get("credentials_status")),
     ]
-    text = " ".join(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "") for value in values).lower()
-    return "403" in text or "forbidden" in text or "account_deactivated" in text or "deactivated" in text or "banned" in text
+    if any(value in {"403", "forbidden", "accountdeactivated", "deactivated", "banned"} for value in status_values):
+        return True
+
+    error_text = field_text(account.get("error_message")).lower()
+    return any(marker in error_text for marker in (
+        "403",
+        "forbidden",
+        "account_deactivated",
+        "account deactivated",
+        "account has been deactivated",
+        "account has been banned",
+        "deactivated",
+        "banned",
+    ))
 
 
 def delete_sub2api_account(sub: Sub2ApiClient, account: dict[str, Any], reason: str) -> bool:
