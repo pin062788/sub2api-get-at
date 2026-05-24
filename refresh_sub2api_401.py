@@ -1187,17 +1187,10 @@ def main() -> int:
     group_ids = sub.group_ids_by_name(args.sub_group)
     all_accounts = [account for account in sub.list_accounts() if account_email(account)]
     deleted = 0
-    for account in all_accounts:
-        if is_403_account(account):
-            if args.dry_run:
-                deleted += 1
-                log(f"dry-run 命中待删除 sub2api 账号：{account_email(account)}；原因：sub2api 状态为 403/停用", "WARN")
-            else:
-                deleted += 1 if delete_sub2api_account(sub, account, "sub2api 状态为 403/停用") else 0
     accounts = [account for account in all_accounts if is_401_account(account) and not is_403_account(account)]
     if args.limit > 0:
         accounts = accounts[: args.limit]
-    log(f"扫描到 401 账号 {len(accounts)} 个；已删除 403/停用账号 {deleted} 个")
+    log(f"扫描到 401 账号 {len(accounts)} 个")
     if args.save_queue or args.dry_run:
         save_queue(args.queue_file, accounts)
         log(f"401 邮箱队列已保存：{os.path.abspath(args.queue_file)}")
