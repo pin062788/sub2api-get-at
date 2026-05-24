@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import Parser
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -54,10 +55,28 @@ PLAN_DISPLAY_NAMES = {
 LOCAL_CALLBACK_RE = re.compile(r"(https?://localhost[^\s'\"]+)")
 OTP_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 OTP_CONTEXT_RE = re.compile(r"(?:code|verification code|验证码)\D{0,40}(\d{6})(?!\d)", re.IGNORECASE)
+DEACTIVATED_MAIL_MARKERS = (
+    "access deactivated",
+    "account deactivated",
+    "account has been banned",
+    "account has been deleted",
+    "account has been deactivated",
+    "no longer be used",
+    "your account has been banned",
+    "账号已被停用",
+    "账号被禁用",
+    "账号被封禁",
+    "账户已被停用",
+    "账户被禁用",
+)
 
 
 def log(message: str, level: str = "INFO") -> None:
     print(f"[{datetime.now().strftime('%Y/%m/%d %H:%M:%S')}] {level}: {message}", flush=True)
+
+
+class DeactivatedAccountError(RuntimeError):
+    pass
 
 
 def merge(*items: dict[str, Any] | None) -> dict[str, Any]:
@@ -483,28 +502,47 @@ class TempEmailClient:
             log(f"创建/确认临时邮箱失败，继续尝试直接收信：{error}", "WARN")
             return email
 
-    def list_messages(self, email: str, since_ts: float) -> list[MailMessage]:
+    def list_messages(self, email: str, since_ts: float | None = None) -> list[MailMessage]:
         errors: list[str] = []
-        params = {
-            "address": email,
-            "email": email,
-            "recipient": email,
-            "page": 1,
-            "pageSize": 50,
-            "page_size": 50,
-            "offset": 0,
-            "limit": 50,
-        }
+        page_size = 100
         for path in self.mail_paths:
+            collected: list[MailMessage] = []
+            seen_pages: set[tuple[str, ...]] = set()
             try:
-                data = self.request_json("GET", path, params=params)
-                messages = normalize_mail_messages(data)
-                filtered = [item for item in messages if message_matches(item, email, since_ts)]
-                if filtered or messages:
-                    return filtered
+                for page in range(1, 101):
+                    params = {
+                        "address": email,
+                        "email": email,
+                        "recipient": email,
+                        "page": page,
+                        "pageSize": page_size,
+                        "page_size": page_size,
+                        "offset": (page - 1) * page_size,
+                        "limit": page_size,
+                    }
+                    data = self.request_json("GET", path, params=params)
+                    messages = normalize_mail_messages(data)
+                    if not messages:
+                        break
+                    page_keys = tuple(mail_message_key(item) for item in messages)
+                    if page_keys in seen_pages:
+                        break
+                    seen_pages.add(page_keys)
+                    collected.extend(item for item in messages if message_matches(item, email, since_ts))
+                    if len(messages) < page_size:
+                        break
+                if collected:
+                    return collected
             except Exception as error:
                 errors.append(f"{path}: {str(error)[:100]}")
-        raise RuntimeError("Temp Email 收信端点不可用：" + " | ".join(errors[:4]))
+        raise RuntimeError("Temp Email 收信端点不可用或没有匹配邮件：" + " | ".join(errors[:4]))
+
+    def has_deactivated_notice(self, email: str) -> MailMessage | None:
+        messages = sorted(self.list_messages(email, None), key=lambda item: parse_message_time(item.received_at), reverse=True)
+        for message in messages:
+            if is_deactivated_mail_message(message):
+                return message
+        return None
 
     def wait_otp(self, email: str, since_ts: float, excluded: set[str], timeout: int = 180, interval: int = 5) -> str:
         deadline = time.time() + timeout
@@ -512,10 +550,20 @@ class TempEmailClient:
         while time.time() < deadline:
             try:
                 messages = self.list_messages(email, since_ts)
-                for message in sorted(messages, key=lambda item: item.received_at, reverse=True):
-                    code = extract_otp(f"{message.subject}\n{message.body}\n{message.raw}", excluded)
+                messages = sorted(messages, key=lambda item: parse_message_time(item.received_at), reverse=True)
+                for message in messages:
+                    if is_deactivated_mail_message(message):
+                        raise DeactivatedAccountError(f"邮箱收到账号停用通知：mail_id={message.id or '-'}；subject={message.subject[:120]}")
+                    message_key = mail_message_key(message)
+                    if message_key in excluded:
+                        continue
+                    code = extract_message_otp(message, excluded)
                     if code:
+                        excluded.add(message_key)
+                        log(f"命中最新验证码邮件：{email}；mail_id={message.id or '-'}；received_at={message.received_at or '-'}")
                         return code
+            except DeactivatedAccountError:
+                raise
             except Exception as error:
                 last_error = str(error)
             time.sleep(interval)
@@ -608,22 +656,35 @@ def parse_message_time(value: str) -> float:
     if value.isdigit():
         numeric = int(value)
         return numeric / 1000 if numeric > 10**11 else float(numeric)
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    except Exception:
-        return 0
+    for parser in (
+        lambda text: datetime.fromisoformat(text.replace("Z", "+00:00")),
+        parsedate_to_datetime,
+    ):
+        try:
+            parsed = parser(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except Exception:
+            pass
+    return 0
 
 
-def message_matches(message: MailMessage, email: str, since_ts: float) -> bool:
+def message_matches(message: MailMessage, email: str, since_ts: float | None = None) -> bool:
     target = email.strip().lower()
     recipients = {message.address, message.original_recipient}
     if target and target not in recipients and all(target not in text for text in [message.body.lower(), message.raw.lower()]):
         return False
+    if since_ts is None:
+        return True
     received_ts = parse_message_time(message.received_at)
-    return not received_ts or received_ts >= since_ts - 60
+    return received_ts >= since_ts - 10
+
+
+def mail_message_key(message: MailMessage) -> str:
+    if message.id:
+        return f"mail:{message.id}"
+    return f"mail:{message.received_at}:{message.subject[:80]}"
 
 
 def extract_otp(text: str, excluded: set[str]) -> str:
@@ -632,6 +693,27 @@ def extract_otp(text: str, excluded: set[str]) -> str:
             if code not in excluded:
                 return code
     return ""
+
+
+def extract_message_otp(message: MailMessage, excluded: set[str]) -> str:
+    preferred = f"{message.subject}\n{message.body}"
+    return extract_otp(preferred, excluded) or extract_otp(message.raw, excluded)
+
+
+def is_deactivated_mail_message(message: MailMessage) -> bool:
+    text = f"{message.subject}\n{message.body}\n{message.raw}".lower()
+    return any(marker in text for marker in DEACTIVATED_MAIL_MARKERS)
+
+
+def is_deactivated_account_response(status: int, body: Any) -> bool:
+    text = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, (dict, list)) else str(body or "").lower()
+    markers = (
+        "deleted or deactivated",
+        "account has been deleted",
+        "account has been deactivated",
+        "you do not have an account",
+    )
+    return status == 403 and any(marker in text for marker in markers)
 
 
 class Sub2ApiClient:
@@ -724,6 +806,12 @@ class Sub2ApiClient:
             payload["proxy_id"] = account.get("proxy_id")
         return self.req("POST", "/api/v1/admin/accounts", payload)
 
+    def delete_account(self, account: dict[str, Any]) -> Any:
+        account_id = int(account.get("id") or 0)
+        if account_id <= 0:
+            raise RuntimeError("账号缺少 id，无法删除")
+        return self.req("DELETE", f"/api/v1/admin/accounts/{account_id}")
+
 
 def account_email(account: dict[str, Any]) -> str:
     credentials = account.get("credentials") or {}
@@ -740,6 +828,29 @@ def is_401_account(account: dict[str, Any]) -> bool:
     ]
     text = " ".join(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "") for value in values)
     return "401" in text or "unauthorized" in text.lower()
+
+
+def is_403_account(account: dict[str, Any]) -> bool:
+    values = [
+        account.get("status"),
+        account.get("error_message"),
+        account.get("temp_unschedulable_reason"),
+        account.get("session_window_status"),
+        account.get("credentials_status"),
+    ]
+    text = " ".join(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "") for value in values).lower()
+    return "403" in text or "forbidden" in text or "account_deactivated" in text or "deactivated" in text or "banned" in text
+
+
+def delete_sub2api_account(sub: Sub2ApiClient, account: dict[str, Any], reason: str) -> bool:
+    email = account_email(account)
+    try:
+        sub.delete_account(account)
+        log(f"已删除 sub2api 账号：{email}；原因：{reason}", "OK")
+        return True
+    except Exception as error:
+        log(f"删除 sub2api 账号失败：{email}；原因：{reason}；错误：{error}", "ERROR")
+        return False
 
 
 def build_credentials(token_json: dict[str, Any], session_json: dict[str, Any], email: str, fallback_plan: str) -> dict[str, Any]:
@@ -871,7 +982,7 @@ def chatgpt_web_login(email: str, otp_callback: Any, proxy: str = "") -> tuple[d
         "User-Agent": UA,
         "oai-device-id": device_id,
     }, trace_headers())
-    for _ in range(4):
+    for attempt in range(4):
         otp = otp_callback(email, excluded)
         otp_resp = session.do("POST", f"{ISSUER}/api/accounts/email-otp/validate", otp_headers, json_body=email_otp_payload(auth_context, otp))
         otp_json = safe_json_loads(otp_resp["body"])
@@ -882,6 +993,9 @@ def chatgpt_web_login(email: str, otp_callback: Any, proxy: str = "") -> tuple[d
                 raise RuntimeError("OpenAI 要求补手机号验证，当前普通网页登录流程无法继续")
             continue_url = str(otp_json.get("continue_url") or continue_url)
             break
+        if is_deactivated_account_response(otp_resp["status"], otp_json):
+            raise DeactivatedAccountError(f"OpenAI 账号已删除或停用：HTTP {otp_resp['status']} {str(otp_json)[:200]}")
+        log(f"验证码校验失败，第 {attempt + 1}/4 次：HTTP {otp_resp['status']} {str(otp_json)[:160]}", "WARN")
         excluded.add(otp)
     else:
         raise RuntimeError("验证码校验失败")
@@ -968,6 +1082,9 @@ def oauth_authorize(email: str, otp_callback: Any, proxy: str = "") -> tuple[dic
                 raise RuntimeError("OpenAI 要求补手机号验证，当前邮箱验证码流程无法继续获取 authorization code")
             continue_url = otp_json.get("continue_url", continue_url)
             break
+        if is_deactivated_account_response(otp_resp["status"], otp_json):
+            raise DeactivatedAccountError(f"OpenAI 账号已删除或停用：HTTP {otp_resp['status']} {str(otp_json)[:200]}")
+        log(f"验证码校验失败，第 {attempt + 1}/4 次：HTTP {otp_resp['status']} {str(otp_json)[:160]}", "WARN")
         excluded.add(otp)
     else:
         raise RuntimeError("验证码校验失败")
@@ -1020,7 +1137,7 @@ def save_queue(path: str, accounts: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh sub2api 401 ChatGPT accounts")
-    parser.add_argument("--sub-base-url", default="http://localhost:8080")
+    parser.add_argument("--sub-base-url", default="your real info")
     parser.add_argument("--sub-admin-email", default="your real info")
     parser.add_argument("--sub-admin-password", default="your real info")
     parser.add_argument("--sub-group", default="your real info")
@@ -1041,10 +1158,19 @@ def main() -> int:
 
     sub = Sub2ApiClient(args.sub_base_url, args.sub_admin_email, args.sub_admin_password, args.proxy)
     group_ids = sub.group_ids_by_name(args.sub_group)
-    accounts = [account for account in sub.list_accounts() if is_401_account(account) and account_email(account)]
+    all_accounts = [account for account in sub.list_accounts() if account_email(account)]
+    deleted = 0
+    for account in all_accounts:
+        if is_403_account(account):
+            if args.dry_run:
+                deleted += 1
+                log(f"dry-run 命中待删除 sub2api 账号：{account_email(account)}；原因：sub2api 状态为 403/停用", "WARN")
+            else:
+                deleted += 1 if delete_sub2api_account(sub, account, "sub2api 状态为 403/停用") else 0
+    accounts = [account for account in all_accounts if is_401_account(account) and not is_403_account(account)]
     if args.limit > 0:
         accounts = accounts[: args.limit]
-    log(f"扫描到 401 账号 {len(accounts)} 个")
+    log(f"扫描到 401 账号 {len(accounts)} 个；已删除 403/停用账号 {deleted} 个")
     if args.save_queue or args.dry_run:
         save_queue(args.queue_file, accounts)
         log(f"401 邮箱队列已保存：{os.path.abspath(args.queue_file)}")
@@ -1069,6 +1195,9 @@ def main() -> int:
             return code
 
         try:
+            notice = temp_mail.has_deactivated_notice(email)
+            if notice:
+                raise DeactivatedAccountError(f"邮箱历史邮件中发现账号停用通知：mail_id={notice.id or '-'}；subject={notice.subject[:120]}")
             token_json, session_json = chatgpt_web_login(email, otp_callback, args.proxy)
             credentials = build_credentials(token_json, session_json, email, str((account.get("credentials") or {}).get("plan_type") or "free"))
             try:
@@ -1079,10 +1208,12 @@ def main() -> int:
                 updated = sub.create_account(account, credentials, group_ids)
             success += 1
             log(f"补号完成：{email} -> sub2api #{updated.get('id') or account.get('id')}", "OK")
+        except DeactivatedAccountError as error:
+            deleted += 1 if delete_sub2api_account(sub, account, str(error)) else 0
         except Exception as error:
             failed += 1
             log(f"补号失败：{email}；{error}", "ERROR")
-    log(f"完成：成功 {success}，失败 {failed}")
+    log(f"完成：成功 {success}，失败 {failed}，删除 {deleted}")
     return 0 if failed == 0 else 1
 
 

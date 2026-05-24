@@ -6,7 +6,7 @@
 
 处理流程：
 
-1. 登录本地 `sub2api` 管理端。
+1. 登录 `sub2api` 管理端。
 2. 扫描 OpenAI OAuth 账号列表。
 3. 找出错误信息中包含 `401` 或 `unauthorized` 的账号。
 4. 读取这些账号里的邮箱地址。
@@ -22,7 +22,7 @@
 
 脚本内置了当前环境的默认值：
 
-- `sub2api` 地址：`http://localhost:8080`
+- `sub2api` 地址：`your real info`
 - `sub2api` 管理员邮箱：`your real info`
 - `sub2api` 管理员密码：`your real info`
 - `sub2api` 分组：`your real info`
@@ -91,20 +91,20 @@ python3 refresh_sub2api_401.py --limit 1
 如果本机访问 ChatGPT 需要代理：
 
 ```bash
-python3 refresh_sub2api_401.py --proxy http://127.0.0.1:7890
+python3 refresh_sub2api_401.py --proxy your real info
 ```
 
 也可以使用 socks 代理：
 
 ```bash
-python3 refresh_sub2api_401.py --proxy socks5h://127.0.0.1:7890
+python3 refresh_sub2api_401.py --proxy your real info
 ```
 
 ## 6. Cloudflare Temp Email 配置
 
 ### 6.1 只使用默认 Admin Auth
 
-默认已内置：
+默认使用占位配置：
 
 ```bash
 python3 refresh_sub2api_401.py
@@ -115,7 +115,7 @@ python3 refresh_sub2api_401.py
 如果 Cloudflare Worker 站点还配置了额外访问密码，使用：
 
 ```bash
-python3 refresh_sub2api_401.py --temp-custom-auth '你的CustomAuth'
+python3 refresh_sub2api_401.py --temp-custom-auth 'your real info'
 ```
 
 ### 6.3 如果收信端点不是默认路径
@@ -142,9 +142,9 @@ python3 refresh_sub2api_401.py --temp-mail-paths '/admin/mails,/api/messages'
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `--sub-base-url` | `http://localhost:8080` | `sub2api` 管理端基础地址 |
+| `--sub-base-url` | `your real info` | `sub2api` 管理端基础地址 |
 | `--sub-admin-email` | `your real info` | `sub2api` 管理员邮箱 |
-| `--sub-admin-password` | 已内置 | `sub2api` 管理员密码 |
+| `--sub-admin-password` | `your real info` | `sub2api` 管理员密码 |
 | `--sub-group` | `your real info` | 更新账号时使用的 OpenAI 分组名 |
 | `--temp-api` | `your real info` | Cloudflare Temp Email API 地址 |
 | `--temp-admin-auth` | `your real info` | Cloudflare Temp Email Admin Auth |
@@ -175,7 +175,7 @@ python3 refresh_sub2api_401.py
 如果需要代理：
 
 ```bash
-python3 refresh_sub2api_401.py --limit 1 --proxy http://127.0.0.1:7890
+python3 refresh_sub2api_401.py --limit 1 --proxy your real info
 ```
 
 确认单个账号成功后，再去掉 `--limit 1` 批量跑。
@@ -242,7 +242,7 @@ python3 refresh_sub2api_401.py --dry-run --save-queue
 
 ```bash
 python3 refresh_sub2api_401.py \
-  --temp-custom-auth '你的CustomAuth' \
+  --temp-custom-auth 'your real info' \
   --temp-mail-paths '/admin/mails,/api/messages'
 ```
 
@@ -274,7 +274,7 @@ python3 refresh_sub2api_401.py --otp-timeout 300 --otp-interval 5
 建议先单账号验证：
 
 ```bash
-python3 refresh_sub2api_401.py --limit 1 --proxy http://127.0.0.1:7890
+python3 refresh_sub2api_401.py --limit 1 --proxy your real info
 ```
 
 ### 11.5 OAuth token 交换失败
