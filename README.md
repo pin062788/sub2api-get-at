@@ -1,126 +1,216 @@
 # sub2api 401 账号自动补号使用指南
 
-## 1. 功能说明
+`refresh_sub2api_401.py` 用于扫描 `sub2api` 里状态异常的 OpenAI OAuth 账号，重新走 ChatGPT 邮箱验证码登录，生成新的 OAuth 凭据，再写回或新建到 `sub2api`。
 
-`refresh_sub2api_401.py` 用于自动处理本地 `sub2api` 中状态异常的 ChatGPT OAuth 账号。
+## 功能流程
 
-处理流程：
-
-1. 登录 `sub2api` 管理端。
-2. 扫描 OpenAI OAuth 账号列表。
+1. 登录或复用已登录的 `sub2api` 管理端 token。
+2. 扫描 `platform=openai&type=oauth` 的账号。
 3. 找出错误信息中包含 `401` 或 `unauthorized` 的账号。
-4. 读取这些账号里的邮箱地址。
-5. 用邮箱验证码方式登录 ChatGPT。
-6. 通过 Cloudflare Temp Email 自动收取验证码。
-7. 获取 `https://chatgpt.com/api/auth/session` 返回的 session/token 信息。
-8. 转换成 `sub2api` OpenAI OAuth 账号凭据。
-9. 优先更新原账号；如果开启兜底参数，也可以在更新失败时创建新账号。
+4. 从账号凭据、邮箱字段或账号名称中提取邮箱。
+5. 通过 ChatGPT 邮箱验证码登录。
+6. 从 Cloudflare Temp Email 或本地 Hotmail Helper 获取验证码。
+7. 获取 ChatGPT session/token 并转换成 `sub2api` OAuth 凭据。
+8. 默认更新原账号，也可以直接创建新账号绕过旧错误状态。
 
-默认不需要 ChatGPT 密码。
+## 安装依赖
 
-## 2. 当前默认配置
-
-脚本内置了当前环境的默认值：
-
-- `sub2api` 地址：`your real info`
-- `sub2api` 管理员邮箱：`your real info`
-- `sub2api` 管理员密码：`your real info`
-- `sub2api` 分组：`your real info`
-- Cloudflare Temp Email API：`your real info`
-- Cloudflare Temp Email Admin Auth：`your real info`
-- Cloudflare Temp Email 域名：`your real info`
-
-如果这些值没变，正式运行时可以不传参数。
-
-## 3. 安装依赖
-
-进入当前目录：
+建议使用虚拟环境：
 
 ```bash
-cd your real info
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-安装依赖：
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-当前依赖只有：
+依赖目前只有：
 
 ```text
 curl_cffi
 ```
 
-## 4. 先做 dry-run 扫描
+## 快速命令
 
-建议先执行 dry-run。这个命令只扫描，不登录 ChatGPT，也不会更新 `sub2api`。
-
-```bash
-python3 refresh_sub2api_401.py --dry-run
-```
-
-如果还想把扫描到的 401 邮箱保存为文本队列：
+公网 `sub2api` 只扫描 401：
 
 ```bash
-python3 refresh_sub2api_401.py --dry-run --save-queue
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url https://sub2api.example.com \
+  --sub-access-token 'Bearer <SUB2API_ACCESS_TOKEN>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --dry-run --save-queue
 ```
 
-默认队列文件是：
+公网 `sub2api` 扫描并修复 401。先启动 Hotmail Helper：
+
+```bash
+python3 scripts/hotmail_helper.py --port 17373
+```
+
+准备 `hotmail_accounts.txt`：
 
 ```text
-401_accounts.txt
+email----password----clientId----refreshToken
 ```
 
-队列文件只是辅助查看和排查；正式流程不依赖它。脚本默认会直接从 `sub2api` 扫描后逐个处理。
-
-## 5. 正式运行
-
-默认配置不变时，直接运行：
+再执行修复：
 
 ```bash
-python3 refresh_sub2api_401.py
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url https://sub2api.example.com \
+  --sub-access-token 'Bearer <SUB2API_ACCESS_TOKEN>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --otp-provider hotmail-local \
+  --hotmail-helper-url http://127.0.0.1:17373 \
+  --hotmail-accounts-file hotmail_accounts.txt \
+  --create-instead-of-update \
+  --skip-if-active-email-exists \
+  --otp-timeout 300 \
+  --otp-interval 8
 ```
 
-限制本次最多处理 1 个账号，适合首次验证：
+`--create-instead-of-update` 会直接创建新账号，适合旧 401 账号状态无法自动清除的环境；`--skip-if-active-email-exists` 用来避免同邮箱重复创建。
+
+## 扫描 401
+
+本地 `sub2api` 可直接用账号密码：
 
 ```bash
-python3 refresh_sub2api_401.py --limit 1
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url http://localhost:8080 \
+  --sub-admin-email '<SUB2API_ADMIN_EMAIL>' \
+  --sub-admin-password '<SUB2API_ADMIN_PASSWORD>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --dry-run --save-queue
 ```
 
-如果本机访问 ChatGPT 需要代理：
+公网 `sub2api` 如果开启了 Cloudflare Turnstile，推荐从浏览器已登录后台的 Network 请求里复制 `Authorization: Bearer ...`，然后跳过登录：
 
 ```bash
-python3 refresh_sub2api_401.py --proxy your real info
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url https://sub2api.example.com \
+  --sub-access-token 'Bearer <SUB2API_ACCESS_TOKEN>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --dry-run --save-queue
 ```
 
-也可以使用 socks 代理：
+`--save-queue` 会把扫描到的 401 邮箱写入 `401_accounts.txt`，只用于排查和预检；正式运行仍会实时扫描 `sub2api`。
+
+## Outlook/Hotmail Helper
+
+Outlook/Hotmail 邮箱需要启动本项目自带的 `scripts/hotmail_helper.py`。它用 `clientId + refreshToken` 换 Microsoft access token，优先通过 IMAP XOAUTH2 读取 `outlook.office365.com`，失败时回退到 Graph API 和 Outlook REST API。它不会用 Outlook 密码登录网页版。
+
+先启动 helper：
 
 ```bash
-python3 refresh_sub2api_401.py --proxy your real info
+cd "$PWD"
+python3 scripts/hotmail_helper.py --port 17373
 ```
 
-## 6. Cloudflare Temp Email 配置
+保持 helper 终端打开。看到类似输出说明启动成功：
 
-### 6.1 只使用默认 Admin Auth
+```text
+Hotmail helper listening on http://127.0.0.1:17373
+```
 
-默认使用占位配置：
+helper 会在本项目 `data/` 目录下写少量运行记录文件；`data/` 默认不建议提交。
+
+账号文件格式：
+
+```text
+email----password----clientId----refreshToken
+```
+
+保存为 `hotmail_accounts.txt`。脚本会用 401 账号邮箱在该文件中精确匹配对应的 `clientId/refreshToken`，几百个账号也可以直接放进去。
+
+可以用下面的命令检查 helper 是否能读邮箱：
 
 ```bash
-python3 refresh_sub2api_401.py
+.venv/bin/python - <<'PY'
+from refresh_sub2api_401 import load_hotmail_accounts
+from curl_cffi import requests as rq
+
+accounts = load_hotmail_accounts("hotmail_accounts.txt")
+email = next(iter(accounts))
+account = accounts[email]
+response = rq.post("http://127.0.0.1:17373/messages", json={
+    "email": email,
+    "clientId": account["client_id"],
+    "refreshToken": account["refresh_token"],
+    "mailboxes": ["INBOX", "Junk"],
+    "top": 2,
+}, timeout=60)
+print(response.status_code)
+print(response.text[:1000])
+PY
 ```
 
-### 6.2 如果还有额外访问密码
+正常返回应为 JSON，包含 `ok: true` 和 `messages`。
 
-如果 Cloudflare Worker 站点还配置了额外访问密码，使用：
+## 正式运行
+
+默认策略是更新原 401 账号：
 
 ```bash
-python3 refresh_sub2api_401.py --temp-custom-auth 'your real info'
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url https://sub2api.example.com \
+  --sub-access-token 'Bearer <SUB2API_ACCESS_TOKEN>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --otp-provider hotmail-local \
+  --hotmail-helper-url http://127.0.0.1:17373 \
+  --hotmail-accounts-file hotmail_accounts.txt \
+  --limit 1
 ```
 
-### 6.3 如果收信端点不是默认路径
+如果旧账号更新成功但 `sub2api` 仍残留 `status=error` 或旧 `error_message`，可以改用直接创建新账号：
 
-脚本会自动尝试这些常见收信端点：
+```bash
+.venv/bin/python refresh_sub2api_401.py \
+  --sub-base-url https://sub2api.example.com \
+  --sub-access-token 'Bearer <SUB2API_ACCESS_TOKEN>' \
+  --sub-group '<OPENAI_GROUP_NAME>' \
+  --otp-provider hotmail-local \
+  --hotmail-helper-url http://127.0.0.1:17373 \
+  --hotmail-accounts-file hotmail_accounts.txt \
+  --create-instead-of-update \
+  --skip-if-active-email-exists \
+  --otp-timeout 300 \
+  --otp-interval 8
+```
+
+`--create-instead-of-update` 会直接 `POST /api/v1/admin/accounts` 创建新账号，不更新旧 401 账号。
+
+`--skip-if-active-email-exists` 会在同邮箱已有 `active` 账号时跳过旧 401，避免重复创建。
+
+## Cloudflare Temp Email
+
+如果账号邮箱是 Cloudflare Temp Email，使用默认验证码来源即可：
+
+```bash
+.venv/bin/python refresh_sub2api_401.py \
+  --otp-provider temp-email \
+  --temp-api 'https://temp-email.example.com' \
+  --temp-admin-auth '<TEMP_EMAIL_ADMIN_AUTH>' \
+  --temp-domain '<TEMP_EMAIL_DOMAIN>'
+```
+
+如果 Worker 有额外访问密码：
+
+```bash
+.venv/bin/python refresh_sub2api_401.py \
+  --temp-custom-auth '你的CustomAuth'
+```
+
+如果收信端点不是默认路径：
+
+```bash
+.venv/bin/python refresh_sub2api_401.py \
+  --temp-mail-paths '/admin/mails,/api/messages'
+```
+
+脚本默认会尝试：
 
 ```text
 /admin/mails
@@ -132,171 +222,76 @@ python3 refresh_sub2api_401.py --temp-custom-auth 'your real info'
 /messages
 ```
 
-如果你的 Worker 使用了不同路径，可以显式指定，多个路径用英文逗号分隔：
-
-```bash
-python3 refresh_sub2api_401.py --temp-mail-paths '/admin/mails,/api/messages'
-```
-
-## 7. 常用参数
+## 常用参数
 
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `--sub-base-url` | `your real info` | `sub2api` 管理端基础地址 |
-| `--sub-admin-email` | `your real info` | `sub2api` 管理员邮箱 |
-| `--sub-admin-password` | `your real info` | `sub2api` 管理员密码 |
-| `--sub-group` | `your real info` | 更新账号时使用的 OpenAI 分组名 |
-| `--temp-api` | `your real info` | Cloudflare Temp Email API 地址 |
-| `--temp-admin-auth` | `your real info` | Cloudflare Temp Email Admin Auth |
+| `--sub-base-url` | `http://localhost:8080` | `sub2api` 管理端基础地址 |
+| `--sub-admin-email` | 占位值 | `sub2api` 管理员邮箱 |
+| `--sub-admin-password` | 占位值 | `sub2api` 管理员密码 |
+| `--sub-turnstile-token` | 空 | 公网登录开启 Turnstile 时使用的登录验证码 token |
+| `--sub-access-token` | 空 | 已登录后台 API 请求里的 `Authorization: Bearer ...`，提供后跳过登录 |
+| `--sub-group` | 占位值 | 写入账号时使用的 OpenAI 分组名 |
+| `--otp-provider` | `temp-email` | 验证码来源：`temp-email` 或 `hotmail-local` |
+| `--hotmail-helper-url` | `http://127.0.0.1:17373` | 本地 Hotmail Helper 地址 |
+| `--hotmail-accounts-file` | 空 | Hotmail 账号文件 |
+| `--hotmail-account` | 空 | 单条 Hotmail 账号，格式同账号文件 |
+| `--hotmail-mailboxes` | `INBOX,Junk` | Hotmail helper 查询的邮箱目录 |
+| `--temp-api` | 占位值 | Cloudflare Temp Email API 地址 |
+| `--temp-admin-auth` | 占位值 | Cloudflare Temp Email Admin Auth |
 | `--temp-custom-auth` | 空 | Cloudflare Worker 额外访问认证 |
-| `--temp-domain` | `your real info` | 临时邮箱域名 |
+| `--temp-domain` | 占位值 | 临时邮箱域名 |
 | `--temp-mail-paths` | 自动尝试常见路径 | 自定义收信接口路径 |
 | `--queue-file` | `401_accounts.txt` | 保存 401 邮箱队列的文件名 |
 | `--save-queue` | 关闭 | 额外保存扫描到的邮箱队列 |
-| `--dry-run` | 关闭 | 只扫描，不登录、不更新 |
+| `--dry-run` | 关闭 | 只扫描，不登录 ChatGPT、不写入 |
 | `--limit` | `0` | 限制处理数量，`0` 表示不限制 |
 | `--proxy` | 空 | 访问 ChatGPT 使用的代理 |
 | `--otp-timeout` | `180` | 等待验证码的超时时间，单位秒 |
 | `--otp-interval` | `5` | 轮询邮箱验证码的间隔，单位秒 |
-| `--create-on-update-fail` | 关闭 | 更新原账号失败时改为创建新账号 |
+| `--create-instead-of-update` | 关闭 | 直接创建新账号，不更新原 401 账号 |
+| `--skip-if-active-email-exists` | 关闭 | 同邮箱已有 active 账号时跳过旧 401 |
+| `--create-on-update-fail` | 关闭 | PUT 更新失败时改为创建新账号 |
 
-## 8. 推荐运行顺序
+## 常见问题
 
-第一次使用建议按这个顺序：
+### 公网登录提示 turnstile verification failed
 
-```bash
-cd your real info
-python3 -m pip install -r requirements.txt
-python3 refresh_sub2api_401.py --dry-run --save-queue
-python3 refresh_sub2api_401.py --limit 1
-python3 refresh_sub2api_401.py
-```
+说明公网后台开启了 Turnstile。优先使用浏览器已登录后台请求里的 `Authorization: Bearer ...`，通过 `--sub-access-token` 跳过登录。
 
-如果需要代理：
+### Hotmail helper 返回 502 或空响应
+
+通常不是 helper 正常响应。先确认 helper 真正在监听：
 
 ```bash
-python3 refresh_sub2api_401.py --limit 1 --proxy your real info
+python3 scripts/hotmail_helper.py --port 17373
 ```
 
-确认单个账号成功后，再去掉 `--limit 1` 批量跑。
+正常 helper 的 `/messages` 和 `/code` 返回 JSON。若原生 socket 连接被拒绝，说明 helper 没启动或端口不对。
 
-## 9. 更新策略
+### 验证码校验失败
 
-脚本默认使用：
-
-```text
-PUT /api/v1/admin/accounts/{id}
-```
-
-也就是直接更新原来的 401 账号。
-
-这样不依赖“重复导入同邮箱是否覆盖”，也不需要先删除账号。
-
-如果某些环境里更新接口失败，可以开启兜底创建：
+脚本已经拿到验证码，但 OpenAI 校验不接受。常见原因是验证码邮件延迟、重复旧码、账号风控或 OpenAI 登录流程状态异常。可以单账号重试并拉长等待：
 
 ```bash
-python3 refresh_sub2api_401.py --create-on-update-fail
+.venv/bin/python refresh_sub2api_401.py \
+  --limit 1 \
+  --otp-timeout 300 \
+  --otp-interval 8
 ```
 
-注意：这个参数只在更新失败时创建新账号，不会主动删除旧账号。
+### 更新成功但旧账号仍然 401
 
-## 10. 日志说明
-
-运行时会输出类似日志：
-
-```text
-[2026/05/23 13:18:47] INFO: 扫描到 401 账号 3 个
-[2026/05/23 13:18:50] INFO: 开始补号：your real info
-[2026/05/23 13:18:56] INFO: 等待邮箱验证码：your real info
-[2026/05/23 13:19:08] INFO: 已获取邮箱验证码：your real info
-[2026/05/23 13:19:15] OK: 补号完成：your real info -> sub2api #123
-```
-
-最终会输出成功和失败数量。
-
-## 11. 常见问题
-
-### 11.1 扫描到 0 个 401 账号
-
-说明当前 `sub2api` 账号列表里没有错误信息包含 `401` 或 `unauthorized` 的 OpenAI OAuth 账号。
-
-可以先用：
+部分 `sub2api` 环境 PUT 成功后不会清掉旧账号的 `status/error_message`，或写入后立刻被上游检测为异常。此时可以用：
 
 ```bash
-python3 refresh_sub2api_401.py --dry-run --save-queue
+--create-instead-of-update --skip-if-active-email-exists
 ```
 
-确认队列文件是否为空。
+先创建新 active 账号，再后续手动处理旧 401 账号。
 
-### 11.2 Cloudflare Temp Email 返回 403
+## 安全注意
 
-通常是认证信息或 Worker 访问保护不匹配。
-
-优先检查：
-
-- `--temp-admin-auth` 是否正确。
-- 是否还需要传 `--temp-custom-auth`。
-- Worker 的收信端点是否和默认路径一致。
-
-可尝试：
-
-```bash
-python3 refresh_sub2api_401.py \
-  --temp-custom-auth 'your real info' \
-  --temp-mail-paths '/admin/mails,/api/messages'
-```
-
-### 11.3 等待验证码超时
-
-可能原因：
-
-- ChatGPT 没有发送验证码。
-- Cloudflare Temp Email 没有收到转发邮件。
-- 收信端点路径不匹配。
-- 验证码邮件延迟。
-
-可以加大等待时间：
-
-```bash
-python3 refresh_sub2api_401.py --otp-timeout 300 --otp-interval 5
-```
-
-### 11.4 未获取 authorization code
-
-说明验证码后没有顺利进入 OAuth 回调阶段。
-
-常见原因：
-
-- ChatGPT 风控或页面状态变化。
-- 代理不稳定。
-- 当前账号需要额外验证。
-
-建议先单账号验证：
-
-```bash
-python3 refresh_sub2api_401.py --limit 1 --proxy your real info
-```
-
-### 11.5 OAuth token 交换失败
-
-说明已拿到授权码，但换 token 阶段失败。
-
-优先检查：
-
-- 网络代理是否稳定。
-- ChatGPT 登录流程是否被风控。
-- 当前账号是否进入额外验证状态。
-
-## 12. 安全注意事项
-
-- 文档和脚本包含本地 `sub2api` 管理员密码、Temp Email Admin Auth 等配置，建议只放在受控环境中。
-- 不要把包含真实管理密码的文件公开提交到公共仓库。
-- `--save-queue` 生成的 `401_accounts.txt` 会包含邮箱地址，如不需要可删除。
-
-## 13. 一句话运行版
-
-确认依赖已安装后，默认环境直接运行：
-
-```bash
-cd your real info && python3 refresh_sub2api_401.py
-```
+- `sub2api` Bearer token、管理员密码、Hotmail `refreshToken`、Temp Email Admin Auth 都是敏感凭据。
+- 不要提交 `hotmail_accounts.txt`、`401_accounts.txt`、`.venv/`、缓存文件。
+- `--save-queue` 生成的 `401_accounts.txt` 会包含邮箱地址，用完可删除。

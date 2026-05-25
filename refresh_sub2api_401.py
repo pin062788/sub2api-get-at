@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import Parser
-from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
@@ -55,28 +54,10 @@ PLAN_DISPLAY_NAMES = {
 LOCAL_CALLBACK_RE = re.compile(r"(https?://localhost[^\s'\"]+)")
 OTP_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 OTP_CONTEXT_RE = re.compile(r"(?:code|verification code|验证码)\D{0,40}(\d{6})(?!\d)", re.IGNORECASE)
-DEACTIVATED_MAIL_MARKERS = (
-    "access deactivated",
-    "account deactivated",
-    "account has been banned",
-    "account has been deleted",
-    "account has been deactivated",
-    "no longer be used",
-    "your account has been banned",
-    "账号已被停用",
-    "账号被禁用",
-    "账号被封禁",
-    "账户已被停用",
-    "账户被禁用",
-)
 
 
 def log(message: str, level: str = "INFO") -> None:
     print(f"[{datetime.now().strftime('%Y/%m/%d %H:%M:%S')}] {level}: {message}", flush=True)
-
-
-class DeactivatedAccountError(RuntimeError):
-    pass
 
 
 def merge(*items: dict[str, Any] | None) -> dict[str, Any]:
@@ -502,47 +483,28 @@ class TempEmailClient:
             log(f"创建/确认临时邮箱失败，继续尝试直接收信：{error}", "WARN")
             return email
 
-    def list_messages(self, email: str, since_ts: float | None = None) -> list[MailMessage]:
+    def list_messages(self, email: str, since_ts: float) -> list[MailMessage]:
         errors: list[str] = []
-        page_size = 100
+        params = {
+            "address": email,
+            "email": email,
+            "recipient": email,
+            "page": 1,
+            "pageSize": 50,
+            "page_size": 50,
+            "offset": 0,
+            "limit": 50,
+        }
         for path in self.mail_paths:
-            collected: list[MailMessage] = []
-            seen_pages: set[tuple[str, ...]] = set()
             try:
-                for page in range(1, 101):
-                    params = {
-                        "address": email,
-                        "email": email,
-                        "recipient": email,
-                        "page": page,
-                        "pageSize": page_size,
-                        "page_size": page_size,
-                        "offset": (page - 1) * page_size,
-                        "limit": page_size,
-                    }
-                    data = self.request_json("GET", path, params=params)
-                    messages = normalize_mail_messages(data)
-                    if not messages:
-                        break
-                    page_keys = tuple(mail_message_key(item) for item in messages)
-                    if page_keys in seen_pages:
-                        break
-                    seen_pages.add(page_keys)
-                    collected.extend(item for item in messages if message_matches(item, email, since_ts))
-                    if len(messages) < page_size:
-                        break
-                if collected:
-                    return collected
+                data = self.request_json("GET", path, params=params)
+                messages = normalize_mail_messages(data)
+                filtered = [item for item in messages if message_matches(item, email, since_ts)]
+                if filtered or messages:
+                    return filtered
             except Exception as error:
                 errors.append(f"{path}: {str(error)[:100]}")
-        raise RuntimeError("Temp Email 收信端点不可用或没有匹配邮件：" + " | ".join(errors[:4]))
-
-    def has_deactivated_notice(self, email: str) -> MailMessage | None:
-        messages = sorted(self.list_messages(email, None), key=lambda item: parse_message_time(item.received_at), reverse=True)
-        for message in messages:
-            if is_deactivated_mail_message(message):
-                return message
-        return None
+        raise RuntimeError("Temp Email 收信端点不可用：" + " | ".join(errors[:4]))
 
     def wait_otp(self, email: str, since_ts: float, excluded: set[str], timeout: int = 180, interval: int = 5) -> str:
         deadline = time.time() + timeout
@@ -550,24 +512,124 @@ class TempEmailClient:
         while time.time() < deadline:
             try:
                 messages = self.list_messages(email, since_ts)
-                messages = sorted(messages, key=lambda item: parse_message_time(item.received_at), reverse=True)
-                for message in messages:
-                    if is_deactivated_mail_message(message):
-                        raise DeactivatedAccountError(f"邮箱收到账号停用通知：mail_id={message.id or '-'}；subject={message.subject[:120]}")
-                    message_key = mail_message_key(message)
-                    if message_key in excluded:
-                        continue
-                    code = extract_message_otp(message, excluded)
+                for message in sorted(messages, key=lambda item: item.received_at, reverse=True):
+                    code = extract_otp(f"{message.subject}\n{message.body}\n{message.raw}", excluded)
                     if code:
-                        excluded.add(message_key)
-                        log(f"命中最新验证码邮件：{email}；mail_id={message.id or '-'}；received_at={message.received_at or '-'}")
                         return code
-            except DeactivatedAccountError:
-                raise
             except Exception as error:
                 last_error = str(error)
             time.sleep(interval)
         raise TimeoutError(f"等待验证码超时：{email}；最后错误：{last_error}")
+
+
+class HotmailLocalClient:
+    def __init__(
+        self,
+        base_url: str,
+        accounts: dict[str, dict[str, str]],
+        session: Any | None = None,
+        mailboxes: list[str] | None = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.accounts = {email.strip().lower(): data for email, data in accounts.items() if email.strip()}
+        self.session = session or rq.Session(impersonate="chrome131")
+        self.mailboxes = mailboxes or ["INBOX", "Junk"]
+
+    def account_for(self, email: str) -> dict[str, str]:
+        normalized = email.strip().lower()
+        account = self.accounts.get(normalized)
+        if not account:
+            raise RuntimeError(f"未找到 Outlook/Hotmail 账号配置：{email}")
+        if not account.get("client_id"):
+            raise RuntimeError(f"Outlook/Hotmail 账号缺少 client_id：{email}")
+        if not account.get("refresh_token"):
+            raise RuntimeError(f"Outlook/Hotmail 账号缺少 refresh_token：{email}")
+        return account
+
+    def request_code(self, email: str, since_ts: float, excluded: set[str]) -> dict[str, Any]:
+        account = self.account_for(email)
+        payload = {
+            "email": email,
+            "clientId": account["client_id"],
+            "refreshToken": account["refresh_token"],
+            "mailboxes": self.mailboxes,
+            "top": 5,
+            "senderFilters": [],
+            "subjectFilters": [],
+            "requiredKeywords": [],
+            "codePatterns": [],
+            "excludeCodes": sorted(excluded),
+            "filterAfterTimestamp": int(max(0, since_ts) * 1000),
+        }
+        response = self.session.request(
+            "POST",
+            f"{self.base_url}/code",
+            json=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=45,
+            verify=False,
+        )
+        raw = response.text or ""
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"Hotmail 本地助手返回非 JSON：{raw[:160]}") from exc
+        if response.status_code >= 400 or data.get("ok") is False:
+            raise RuntimeError(str(data.get("error") or data.get("message") or raw or f"HTTP {response.status_code}")[:240])
+        next_refresh_token = str(data.get("nextRefreshToken") or "").strip()
+        if next_refresh_token:
+            account["refresh_token"] = next_refresh_token
+        return data
+
+    def wait_otp(self, email: str, since_ts: float, excluded: set[str], timeout: int = 180, interval: int = 5) -> str:
+        deadline = time.time() + timeout
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                data = self.request_code(email, since_ts, excluded)
+                code = str(data.get("code") or "").strip()
+                if code and code not in excluded:
+                    return code
+            except Exception as error:
+                last_error = str(error)
+            time.sleep(interval)
+        raise TimeoutError(f"等待 Outlook/Hotmail 验证码超时：{email}；最后错误：{last_error}")
+
+
+def parse_hotmail_account_line(line: str) -> tuple[str, dict[str, str]] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if re.match(r"^账号----密码----ID----Token$", stripped, re.IGNORECASE):
+        return None
+    parts = [part.strip() for part in stripped.split("----")]
+    if len(parts) < 4:
+        raise ValueError(f"Hotmail 账号行格式错误，应为 email----password----clientId----refreshToken：{stripped[:80]}")
+    email, password, client_id, refresh_token = parts[:4]
+    if not email or not client_id or not refresh_token:
+        raise ValueError(f"Hotmail 账号行缺少 email/clientId/refreshToken：{stripped[:80]}")
+    return email.lower(), {
+        "email": email,
+        "password": password,
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+    }
+
+
+def load_hotmail_accounts(path: str = "", inline: str = "") -> dict[str, dict[str, str]]:
+    accounts: dict[str, dict[str, str]] = {}
+    lines: list[str] = []
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines.extend(handle.readlines())
+    if inline:
+        lines.extend(inline.splitlines())
+    for line in lines:
+        parsed = parse_hotmail_account_line(line)
+        if parsed:
+            email, account = parsed
+            accounts[email] = account
+    return accounts
 
 
 def first_non_empty(data: Any, paths: list[str]) -> str:
@@ -656,35 +718,22 @@ def parse_message_time(value: str) -> float:
     if value.isdigit():
         numeric = int(value)
         return numeric / 1000 if numeric > 10**11 else float(numeric)
-    for parser in (
-        lambda text: datetime.fromisoformat(text.replace("Z", "+00:00")),
-        parsedate_to_datetime,
-    ):
-        try:
-            parsed = parser(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        except Exception:
-            pass
-    return 0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return 0
 
 
-def message_matches(message: MailMessage, email: str, since_ts: float | None = None) -> bool:
+def message_matches(message: MailMessage, email: str, since_ts: float) -> bool:
     target = email.strip().lower()
     recipients = {message.address, message.original_recipient}
     if target and target not in recipients and all(target not in text for text in [message.body.lower(), message.raw.lower()]):
         return False
-    if since_ts is None:
-        return True
     received_ts = parse_message_time(message.received_at)
-    return received_ts >= since_ts - 10
-
-
-def mail_message_key(message: MailMessage) -> str:
-    if message.id:
-        return f"mail:{message.id}"
-    return f"mail:{message.received_at}:{message.subject[:80]}"
+    return not received_ts or received_ts >= since_ts - 60
 
 
 def extract_otp(text: str, excluded: set[str]) -> str:
@@ -694,35 +743,37 @@ def extract_otp(text: str, excluded: set[str]) -> str:
                 return code
     return ""
 
-
-def extract_message_otp(message: MailMessage, excluded: set[str]) -> str:
-    preferred = f"{message.subject}\n{message.body}"
-    return extract_otp(preferred, excluded) or extract_otp(message.raw, excluded)
-
-
-def is_deactivated_mail_message(message: MailMessage) -> bool:
-    text = f"{message.subject}\n{message.body}\n{message.raw}".lower()
-    return any(marker in text for marker in DEACTIVATED_MAIL_MARKERS)
+def build_sub2api_login_payload(email: str, password: str, turnstile_token: str = "") -> dict[str, str]:
+    payload = {"email": email, "password": password}
+    token = str(turnstile_token or "").strip()
+    if token:
+        payload["turnstile_token"] = token
+    return payload
 
 
-def is_deactivated_account_response(status: int, body: Any) -> bool:
-    text = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, (dict, list)) else str(body or "").lower()
-    markers = (
-        "deleted or deactivated",
-        "account has been deleted",
-        "account has been deactivated",
-        "you do not have an account",
-    )
-    return status == 403 and any(marker in text for marker in markers)
+def choose_account_write_operation(create_instead_of_update: bool = False) -> str:
+    return "create" if create_instead_of_update else "update"
 
 
 class Sub2ApiClient:
-    def __init__(self, base_url: str, email: str, password: str, proxy: str = ""):
+    def __init__(
+        self,
+        base_url: str,
+        email: str,
+        password: str,
+        proxy: str = "",
+        turnstile_token: str = "",
+        access_token: str = "",
+        session: Any | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
-        self.session = rq.Session(impersonate="chrome131")
+        self.session = session or rq.Session(impersonate="chrome131")
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
-        login_data = self.req("POST", "/api/v1/auth/login", {"email": email, "password": password}, token="")
+        if access_token.strip():
+            self.token = access_token.strip().removeprefix("Bearer ").strip()
+            return
+        login_data = self.req("POST", "/api/v1/auth/login", build_sub2api_login_payload(email, password, turnstile_token), token="")
         self.token = login_data.get("access_token", "")
         if not self.token:
             raise RuntimeError("sub2api 登录失败")
@@ -806,30 +857,10 @@ class Sub2ApiClient:
             payload["proxy_id"] = account.get("proxy_id")
         return self.req("POST", "/api/v1/admin/accounts", payload)
 
-    def delete_account(self, account: dict[str, Any]) -> Any:
-        account_id = int(account.get("id") or 0)
-        if account_id <= 0:
-            raise RuntimeError("账号缺少 id，无法删除")
-        return self.req("DELETE", f"/api/v1/admin/accounts/{account_id}")
-
 
 def account_email(account: dict[str, Any]) -> str:
     credentials = account.get("credentials") or {}
     return str(credentials.get("email") or account.get("email") or account.get("name") or "").strip().lower()
-
-
-def normalize_status_value(value: Any) -> str:
-    if isinstance(value, (dict, list)):
-        return normalize_text(json.dumps(value, ensure_ascii=False))
-    return normalize_text(value)
-
-
-def field_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "")
-
-
-def is_active_status(account: dict[str, Any]) -> bool:
-    return normalize_status_value(account.get("status")) in {"active", "ok", "enabled", "normal"}
 
 
 def is_401_account(account: dict[str, Any]) -> bool:
@@ -840,44 +871,32 @@ def is_401_account(account: dict[str, Any]) -> bool:
         account.get("session_window_status"),
         account.get("credentials_status"),
     ]
-    text = " ".join(field_text(value) for value in values).lower()
-    return "401" in text or "unauthorized" in text
+    text = " ".join(json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or "") for value in values)
+    return "401" in text or "unauthorized" in text.lower()
 
 
-def is_403_account(account: dict[str, Any]) -> bool:
-    if is_active_status(account):
-        return False
-
-    status_values = [
-        normalize_status_value(account.get("status")),
-        normalize_status_value(account.get("session_window_status")),
-        normalize_status_value(account.get("credentials_status")),
-    ]
-    if any(value in {"403", "forbidden", "accountdeactivated", "deactivated", "banned"} for value in status_values):
-        return True
-
-    error_text = field_text(account.get("error_message")).lower()
-    return any(marker in error_text for marker in (
-        "403",
-        "forbidden",
-        "account_deactivated",
-        "account deactivated",
-        "account has been deactivated",
-        "account has been banned",
-        "deactivated",
-        "banned",
-    ))
+def is_active_account(account: dict[str, Any]) -> bool:
+    return str(account.get("status") or "").strip().lower() == "active"
 
 
-def delete_sub2api_account(sub: Sub2ApiClient, account: dict[str, Any], reason: str) -> bool:
-    email = account_email(account)
-    try:
-        sub.delete_account(account)
-        log(f"已删除 sub2api 账号：{email}；原因：{reason}", "OK")
-        return True
-    except Exception as error:
-        log(f"删除 sub2api 账号失败：{email}；原因：{reason}；错误：{error}", "ERROR")
-        return False
+def filter_accounts_with_active_email_guard(
+    target_accounts: list[dict[str, Any]],
+    all_accounts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    active_emails = {
+        account_email(account)
+        for account in all_accounts
+        if is_active_account(account) and account_email(account)
+    }
+    filtered: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for account in target_accounts:
+        email = account_email(account)
+        if email and email in active_emails:
+            skipped.append(email)
+            continue
+        filtered.append(account)
+    return filtered, skipped
 
 
 def build_credentials(token_json: dict[str, Any], session_json: dict[str, Any], email: str, fallback_plan: str) -> dict[str, Any]:
@@ -1009,7 +1028,7 @@ def chatgpt_web_login(email: str, otp_callback: Any, proxy: str = "") -> tuple[d
         "User-Agent": UA,
         "oai-device-id": device_id,
     }, trace_headers())
-    for attempt in range(4):
+    for _ in range(4):
         otp = otp_callback(email, excluded)
         otp_resp = session.do("POST", f"{ISSUER}/api/accounts/email-otp/validate", otp_headers, json_body=email_otp_payload(auth_context, otp))
         otp_json = safe_json_loads(otp_resp["body"])
@@ -1020,9 +1039,6 @@ def chatgpt_web_login(email: str, otp_callback: Any, proxy: str = "") -> tuple[d
                 raise RuntimeError("OpenAI 要求补手机号验证，当前普通网页登录流程无法继续")
             continue_url = str(otp_json.get("continue_url") or continue_url)
             break
-        if is_deactivated_account_response(otp_resp["status"], otp_json):
-            raise DeactivatedAccountError(f"OpenAI 账号已删除或停用：HTTP {otp_resp['status']} {str(otp_json)[:200]}")
-        log(f"验证码校验失败，第 {attempt + 1}/4 次：HTTP {otp_resp['status']} {str(otp_json)[:160]}", "WARN")
         excluded.add(otp)
     else:
         raise RuntimeError("验证码校验失败")
@@ -1109,9 +1125,6 @@ def oauth_authorize(email: str, otp_callback: Any, proxy: str = "") -> tuple[dic
                 raise RuntimeError("OpenAI 要求补手机号验证，当前邮箱验证码流程无法继续获取 authorization code")
             continue_url = otp_json.get("continue_url", continue_url)
             break
-        if is_deactivated_account_response(otp_resp["status"], otp_json):
-            raise DeactivatedAccountError(f"OpenAI 账号已删除或停用：HTTP {otp_resp['status']} {str(otp_json)[:200]}")
-        log(f"验证码校验失败，第 {attempt + 1}/4 次：HTTP {otp_resp['status']} {str(otp_json)[:160]}", "WARN")
         excluded.add(otp)
     else:
         raise RuntimeError("验证码校验失败")
@@ -1164,15 +1177,22 @@ def save_queue(path: str, accounts: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh sub2api 401 ChatGPT accounts")
-    parser.add_argument("--sub-base-url", default="your real info")
+    parser.add_argument("--sub-base-url", default="http://localhost:8080")
     parser.add_argument("--sub-admin-email", default="your real info")
     parser.add_argument("--sub-admin-password", default="your real info")
+    parser.add_argument("--sub-turnstile-token", default="", help="公网 sub2api 开启 Turnstile 时，从浏览器验证后取得的 turnstile_token")
+    parser.add_argument("--sub-access-token", default="", help="已登录后台 API 请求里的 Authorization Bearer token；提供后跳过登录")
     parser.add_argument("--sub-group", default="your real info")
     parser.add_argument("--temp-api", default="your real info")
     parser.add_argument("--temp-admin-auth", default="your real info")
     parser.add_argument("--temp-custom-auth", default="")
     parser.add_argument("--temp-domain", default="your real info")
     parser.add_argument("--temp-mail-paths", default="", help="逗号分隔的收信端点；不传则尝试常见端点")
+    parser.add_argument("--otp-provider", choices=["temp-email", "hotmail-local"], default="temp-email", help="验证码来源：Cloudflare Temp Email 或 GuJumpgate Hotmail 本地助手")
+    parser.add_argument("--hotmail-helper-url", default="http://127.0.0.1:17373", help="GuJumpgate hotmail_helper.py 地址")
+    parser.add_argument("--hotmail-accounts-file", default="", help="Hotmail 账号文件，格式：email----password----clientId----refreshToken")
+    parser.add_argument("--hotmail-account", default="", help="单条 Hotmail 账号，格式同 --hotmail-accounts-file")
+    parser.add_argument("--hotmail-mailboxes", default="INBOX,Junk", help="逗号分隔的邮箱目录")
     parser.add_argument("--queue-file", default="401_accounts.txt")
     parser.add_argument("--save-queue", action="store_true", help="只额外保存 401 邮箱队列，不影响默认流式处理")
     parser.add_argument("--dry-run", action="store_true", help="只扫描 401 邮箱，不登录、不更新")
@@ -1180,14 +1200,26 @@ def main() -> int:
     parser.add_argument("--proxy", default="")
     parser.add_argument("--otp-timeout", type=int, default=180)
     parser.add_argument("--otp-interval", type=int, default=5)
+    parser.add_argument("--create-instead-of-update", action="store_true", help="拿到新凭据后直接创建新账号，不更新原 401 账号")
+    parser.add_argument("--skip-if-active-email-exists", action="store_true", help="同邮箱已有 active 账号时跳过旧 401，避免重复创建")
     parser.add_argument("--create-on-update-fail", action="store_true", help="PUT 更新失败时改为创建新账号")
     args = parser.parse_args()
 
-    sub = Sub2ApiClient(args.sub_base_url, args.sub_admin_email, args.sub_admin_password, args.proxy)
+    sub = Sub2ApiClient(
+        args.sub_base_url,
+        args.sub_admin_email,
+        args.sub_admin_password,
+        args.proxy,
+        args.sub_turnstile_token,
+        args.sub_access_token,
+    )
     group_ids = sub.group_ids_by_name(args.sub_group)
-    all_accounts = [account for account in sub.list_accounts() if account_email(account)]
-    deleted = 0
-    accounts = [account for account in all_accounts if is_401_account(account) and not is_403_account(account)]
+    all_accounts = sub.list_accounts()
+    accounts = [account for account in all_accounts if is_401_account(account) and account_email(account)]
+    if args.skip_if_active_email_exists:
+        accounts, skipped_emails = filter_accounts_with_active_email_guard(accounts, all_accounts)
+        for skipped_email in skipped_emails:
+            log(f"跳过已有 active 新账号的旧 401 邮箱：{skipped_email}")
     if args.limit > 0:
         accounts = accounts[: args.limit]
     log(f"扫描到 401 账号 {len(accounts)} 个")
@@ -1197,8 +1229,16 @@ def main() -> int:
     if args.dry_run or not accounts:
         return 0
 
-    mail_paths = [item.strip() for item in args.temp_mail_paths.split(",") if item.strip()]
-    temp_mail = TempEmailClient(args.temp_api, args.temp_admin_auth, args.temp_custom_auth, mail_paths=mail_paths or None)
+    temp_mail: TempEmailClient | None = None
+    hotmail_client: HotmailLocalClient | None = None
+    if args.otp_provider == "hotmail-local":
+        hotmail_accounts = load_hotmail_accounts(args.hotmail_accounts_file, args.hotmail_account)
+        hotmail_mailboxes = [item.strip() for item in args.hotmail_mailboxes.split(",") if item.strip()]
+        hotmail_client = HotmailLocalClient(args.hotmail_helper_url, hotmail_accounts, mailboxes=hotmail_mailboxes or None)
+        log(f"已加载 Outlook/Hotmail 账号配置 {len(hotmail_accounts)} 个，使用本地助手：{args.hotmail_helper_url}")
+    else:
+        mail_paths = [item.strip() for item in args.temp_mail_paths.split(",") if item.strip()]
+        temp_mail = TempEmailClient(args.temp_api, args.temp_admin_auth, args.temp_custom_auth, mail_paths=mail_paths or None)
 
     success = 0
     failed = 0
@@ -1206,34 +1246,38 @@ def main() -> int:
         email = account_email(account)
         log(f"开始补号：{email}")
         started_at = time.time()
-        temp_mail.ensure_address(email, args.temp_domain)
+        if temp_mail:
+            temp_mail.ensure_address(email, args.temp_domain)
 
         def otp_callback(current_email: str, excluded: set[str]) -> str:
             log(f"等待邮箱验证码：{current_email}")
-            code = temp_mail.wait_otp(current_email, started_at, excluded, timeout=args.otp_timeout, interval=args.otp_interval)
+            if hotmail_client:
+                code = hotmail_client.wait_otp(current_email, started_at, excluded, timeout=args.otp_timeout, interval=args.otp_interval)
+            elif temp_mail:
+                code = temp_mail.wait_otp(current_email, started_at, excluded, timeout=args.otp_timeout, interval=args.otp_interval)
+            else:
+                raise RuntimeError("未配置验证码来源")
             log(f"已获取邮箱验证码：{current_email}")
             return code
 
         try:
-            notice = temp_mail.has_deactivated_notice(email)
-            if notice:
-                raise DeactivatedAccountError(f"邮箱历史邮件中发现账号停用通知：mail_id={notice.id or '-'}；subject={notice.subject[:120]}")
             token_json, session_json = chatgpt_web_login(email, otp_callback, args.proxy)
             credentials = build_credentials(token_json, session_json, email, str((account.get("credentials") or {}).get("plan_type") or "free"))
-            try:
-                updated = sub.put_account(account, credentials, group_ids)
-            except Exception:
-                if not args.create_on_update_fail:
-                    raise
+            if choose_account_write_operation(args.create_instead_of_update) == "create":
                 updated = sub.create_account(account, credentials, group_ids)
+            else:
+                try:
+                    updated = sub.put_account(account, credentials, group_ids)
+                except Exception:
+                    if not args.create_on_update_fail:
+                        raise
+                    updated = sub.create_account(account, credentials, group_ids)
             success += 1
             log(f"补号完成：{email} -> sub2api #{updated.get('id') or account.get('id')}", "OK")
-        except DeactivatedAccountError as error:
-            deleted += 1 if delete_sub2api_account(sub, account, str(error)) else 0
         except Exception as error:
             failed += 1
             log(f"补号失败：{email}；{error}", "ERROR")
-    log(f"完成：成功 {success}，失败 {failed}，删除 {deleted}")
+    log(f"完成：成功 {success}，失败 {failed}")
     return 0 if failed == 0 else 1
 
 
